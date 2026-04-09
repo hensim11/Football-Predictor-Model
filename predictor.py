@@ -4,13 +4,16 @@
 # 1. Loads multiple Premier League CSV files
 # 2. Cleans and combines them
 # 3. Builds pre-match features using only past information
-# 4. Trains TWO models:
-#       - Logistic Regression
-#       - Random Forest
-# 5. Evaluates both on the latest season
-# 6. Compares their performance
-# 7. Displays a confusion matrix for each model
-# 8. Predicts outcomes for new fixtures using the better model
+# 4. Trains TWO weighted models:
+#       - Weighted Logistic Regression
+#       - Weighted Random Forest
+# 5. Handles class imbalance using class weights
+# 6. Evaluates both on the latest season
+# 7. Compares the models using multiple metrics
+# 8. Displays confusion matrices for:
+#       - Weighted Logistic Regression
+#       - Weighted Random Forest
+# 9. Predicts outcomes for new fixtures using the better model
 #
 # Libraries needed:
 # pip install pandas numpy scikit-learn matplotlib
@@ -37,13 +40,18 @@ from sklearn.metrics import (
     ConfusionMatrixDisplay,
     balanced_accuracy_score,
     f1_score,
-    log_loss
+    log_loss,
+    precision_recall_fscore_support
 )
+from sklearn.utils.class_weight import compute_class_weight
+
 
 # ------------------------------------------------------------
 # 1) LOAD ALL PREMIER LEAGUE CSV FILES
 # ------------------------------------------------------------
-DATA_PATTERN = "C:/Users/hensi/Downloads/match-predictor/E0*.csv"
+# Put this script in the same folder as the CSV files,
+# or change the pattern below to match your file location.
+DATA_PATTERN = "E0*.csv"
 
 files = sorted(glob.glob(DATA_PATTERN))
 
@@ -80,20 +88,28 @@ required_columns = [
     "SourceFile"
 ]
 
+# Create missing required columns if any are absent
 for col in required_columns:
     if col not in matches.columns:
         matches[col] = np.nan
 
 matches = matches[required_columns].copy()
 
+# Convert dates
 matches["Date"] = pd.to_datetime(matches["Date"], dayfirst=True, errors="coerce")
+
+# Remove rows missing essential fields
 matches = matches.dropna(subset=["Date", "HomeTeam", "AwayTeam", "FTR"])
+
+# Keep only valid target classes
 matches = matches[matches["FTR"].isin(["H", "D", "A"])].copy()
 
+# Convert numeric columns safely
 numeric_cols = ["FTHG", "FTAG", "HS", "AS", "HST", "AST"]
 for col in numeric_cols:
     matches[col] = pd.to_numeric(matches[col], errors="coerce").fillna(0)
 
+# Sort in chronological order
 matches = matches.sort_values("Date").reset_index(drop=True)
 
 
@@ -102,8 +118,8 @@ matches = matches.sort_values("Date").reset_index(drop=True)
 # ------------------------------------------------------------
 def get_points(result, side):
     """
-    Returns the points won by a team from a result.
-    result: 'H', 'D', or 'A'
+    Returns the points won by a team based on match result.
+    result: 'H', 'D', 'A'
     side: 'home' or 'away'
     """
     if result == "D":
@@ -117,7 +133,7 @@ def get_points(result, side):
 
 def safe_avg(total, count, default):
     """
-    Returns total / count if count > 0, otherwise a sensible default.
+    Returns total / count if count > 0, otherwise returns a default.
     """
     return total / count if count > 0 else default
 
@@ -127,10 +143,11 @@ def safe_avg(total, count, default):
 # ------------------------------------------------------------
 def build_pre_match_features(df):
     """
-    Builds features using ONLY information available before each match.
-    This avoids data leakage.
+    Builds pre-match features using only information available
+    before each match is played. This avoids data leakage.
     """
 
+    # Team stats across all previous matches
     overall_stats = defaultdict(lambda: {
         "played": 0,
         "wins": 0,
@@ -143,6 +160,7 @@ def build_pre_match_features(df):
         "sot": 0
     })
 
+    # Team stats within the current season
     season_stats = defaultdict(lambda: defaultdict(lambda: {
         "played": 0,
         "wins": 0,
@@ -155,6 +173,7 @@ def build_pre_match_features(df):
         "sot": 0
     }))
 
+    # Recent form trackers
     recent_points = defaultdict(lambda: deque(maxlen=5))
     recent_goal_diff = defaultdict(lambda: deque(maxlen=5))
 
@@ -170,6 +189,7 @@ def build_pre_match_features(df):
         h_season = season_stats[season][home]
         a_season = season_stats[season][away]
 
+        # Build pre-match features
         feature_row = {
             "Date": row["Date"],
             "Season": season,
@@ -177,7 +197,7 @@ def build_pre_match_features(df):
             "AwayTeam": away,
             "FTR": row["FTR"],
 
-            # Overall stats
+            # Overall historical features
             "home_ppg": safe_avg(h_all["points"], h_all["played"], 1.30),
             "away_ppg": safe_avg(a_all["points"], a_all["played"], 1.30),
 
@@ -199,7 +219,7 @@ def build_pre_match_features(df):
             "home_avg_sot": safe_avg(h_all["sot"], h_all["played"], 4.0),
             "away_avg_sot": safe_avg(a_all["sot"], a_all["played"], 4.0),
 
-            # Current season stats
+            # Current season features
             "home_season_ppg": safe_avg(h_season["points"], h_season["played"], 1.30),
             "away_season_ppg": safe_avg(a_season["points"], a_season["played"], 1.30),
 
@@ -209,7 +229,7 @@ def build_pre_match_features(df):
             "home_season_avg_ga": safe_avg(h_season["ga"], h_season["played"], 1.30),
             "away_season_avg_ga": safe_avg(a_season["ga"], a_season["played"], 1.30),
 
-            # Recent form
+            # Last 5 matches form
             "home_form_pts5": np.mean(recent_points[home]) if recent_points[home] else 1.20,
             "away_form_pts5": np.mean(recent_points[away]) if recent_points[away] else 1.20,
 
@@ -217,6 +237,7 @@ def build_pre_match_features(df):
             "away_form_gd5": np.mean(recent_goal_diff[away]) if recent_goal_diff[away] else 0.0,
         }
 
+        # Difference features
         diff_pairs = [
             ("ppg_diff", "home_ppg", "away_ppg"),
             ("win_rate_diff", "home_win_rate", "away_win_rate"),
@@ -237,7 +258,7 @@ def build_pre_match_features(df):
 
         feature_rows.append(feature_row)
 
-        # Update stats AFTER creating this match's pre-match feature row
+        # Update team stats AFTER storing the pre-match features
         ftr = row["FTR"]
         fthg = row["FTHG"]
         ftag = row["FTAG"]
@@ -296,13 +317,38 @@ y_test = test_df["FTR"]
 
 
 # ------------------------------------------------------------
-# 6) PREPROCESSING
+# 6) EXAMINE CLASS IMBALANCE
 # ------------------------------------------------------------
-# We use the same preprocessing for both models to keep the comparison fair.
+print("=" * 80)
+print("CLASS DISTRIBUTION IN TRAINING DATA")
+print("=" * 80)
+print(y_train.value_counts().sort_index())
+print()
+
+# Compute balanced class weights from the training labels only
+classes = np.array(sorted(y_train.unique()))
+weights_array = compute_class_weight(
+    class_weight="balanced",
+    classes=classes,
+    y=y_train
+)
+class_weights = dict(zip(classes, weights_array))
+
+print("Computed class weights:")
+for cls, weight in class_weights.items():
+    print(f"  {cls}: {weight:.4f}")
+print("=" * 80)
+
+
+# ------------------------------------------------------------
+# 7) PREPROCESSING
+# ------------------------------------------------------------
+# Keep preprocessing the same for both models so comparison is fair.
 numeric_features = X_train.select_dtypes(include=["number"]).columns.tolist()
 categorical_features = ["HomeTeam", "AwayTeam"]
 
-preprocessor = ColumnTransformer(
+# Logistic regression benefits from scaling
+preprocessor_for_logistic = ColumnTransformer(
     transformers=[
         (
             "num",
@@ -323,63 +369,99 @@ preprocessor = ColumnTransformer(
     ]
 )
 
+# Random forest does not need scaling, but we still need imputation/encoding
+preprocessor_for_rf = ColumnTransformer(
+    transformers=[
+        (
+            "num",
+            Pipeline(steps=[
+                ("imputer", SimpleImputer(strategy="median"))
+            ]),
+            numeric_features
+        ),
+        (
+            "cat",
+            Pipeline(steps=[
+                ("imputer", SimpleImputer(strategy="most_frequent")),
+                ("onehot", OneHotEncoder(handle_unknown="ignore"))
+            ]),
+            categorical_features
+        ),
+    ]
+)
+
 
 # ------------------------------------------------------------
-# 7) MODELS
+# 8) BUILD WEIGHTED MODELS
 # ------------------------------------------------------------
-logistic_pipeline = Pipeline(steps=[
-    ("preprocessor", preprocessor),
-    ("model", LogisticRegression(max_iter=3000))
+weighted_logistic_pipeline = Pipeline(steps=[
+    ("preprocessor", preprocessor_for_logistic),
+    ("model", LogisticRegression(
+        max_iter=5000,
+        class_weight=class_weights,
+        random_state=42
+    ))
 ])
 
-random_forest_pipeline = Pipeline(steps=[
-    ("preprocessor", preprocessor),
+weighted_random_forest_pipeline = Pipeline(steps=[
+    ("preprocessor", preprocessor_for_rf),
     ("model", RandomForestClassifier(
-        n_estimators=300,
-        max_depth=10,
+        n_estimators=500,
+        max_depth=12,
         min_samples_split=10,
         min_samples_leaf=4,
+        class_weight=class_weights,
         random_state=42,
-        class_weight="balanced"
+        n_jobs=-1
     ))
 ])
 
 
 # ------------------------------------------------------------
-# 8) TRAIN BOTH MODELS
+# 9) TRAIN MODELS
 # ------------------------------------------------------------
-print("=" * 80)
-print("TRAINING MODELS")
-print("=" * 80)
+print("TRAINING WEIGHTED LOGISTIC REGRESSION...")
+weighted_logistic_pipeline.fit(X_train, y_train)
 
-logistic_pipeline.fit(X_train, y_train)
-random_forest_pipeline.fit(X_train, y_train)
+print("TRAINING WEIGHTED RANDOM FOREST...")
+weighted_random_forest_pipeline.fit(X_train, y_train)
 
-print("Finished training Logistic Regression.")
-print("Finished training Random Forest.")
+print("TRAINING COMPLETE.")
 print("=" * 80)
 
 
 # ------------------------------------------------------------
-# 9) EVALUATION FUNCTION
+# 10) EVALUATION FUNCTION
 # ------------------------------------------------------------
 def evaluate_model(model_name, pipeline, X_test, y_test):
     """
-    Evaluates a trained model and returns:
-    - metrics dictionary
-    - predictions
-    - probabilities
-    - confusion matrix
+    Evaluates a model and returns useful outputs for comparison.
     """
     predictions = pipeline.predict(X_test)
     probabilities = pipeline.predict_proba(X_test)
-    class_labels = pipeline.named_steps["model"].classes_
+    model_classes = pipeline.named_steps["model"].classes_
 
     accuracy = accuracy_score(y_test, predictions)
     balanced_acc = balanced_accuracy_score(y_test, predictions)
     macro_f1 = f1_score(y_test, predictions, average="macro")
     weighted_f1 = f1_score(y_test, predictions, average="weighted")
-    multiclass_logloss = log_loss(y_test, probabilities, labels=class_labels)
+    multiclass_logloss = log_loss(y_test, probabilities, labels=model_classes)
+
+    # Per-class precision/recall/f1
+    precision, recall, f1, support = precision_recall_fscore_support(
+        y_test,
+        predictions,
+        labels=["H", "D", "A"],
+        zero_division=0
+    )
+
+    class_breakdown = pd.DataFrame({
+        "Class": ["H", "D", "A"],
+        "Precision": precision,
+        "Recall": recall,
+        "F1": f1,
+        "Support": support
+    })
 
     metrics = {
         "Model": model_name,
@@ -401,8 +483,13 @@ def evaluate_model(model_name, pipeline, X_test, y_test):
     print(f"Weighted F1 Score:  {weighted_f1:.4f}")
     print(f"Log Loss:           {multiclass_logloss:.4f}")
     print("-" * 80)
-    print("Classification Report:")
-    print(classification_report(y_test, predictions, digits=4))
+
+    print("Classification report:")
+    print(classification_report(y_test, predictions, digits=4, zero_division=0))
+
+    print("Per-class breakdown:")
+    print(class_breakdown.to_string(index=False))
+    print("-" * 80)
 
     cm_df = pd.DataFrame(
         cm,
@@ -414,51 +501,58 @@ def evaluate_model(model_name, pipeline, X_test, y_test):
     print(cm_df)
     print("-" * 80)
 
-    return metrics, predictions, probabilities, cm
+    return metrics, predictions, probabilities, cm, class_breakdown
 
 
 # ------------------------------------------------------------
-# 10) EVALUATE BOTH MODELS
+# 11) EVALUATE BOTH WEIGHTED MODELS
 # ------------------------------------------------------------
-log_metrics, log_preds, log_probs, log_cm = evaluate_model(
-    "Logistic Regression",
-    logistic_pipeline,
+log_metrics, log_preds, log_probs, log_cm, log_class_breakdown = evaluate_model(
+    "Weighted Logistic Regression",
+    weighted_logistic_pipeline,
     X_test,
     y_test
 )
 
-rf_metrics, rf_preds, rf_probs, rf_cm = evaluate_model(
-    "Random Forest",
-    random_forest_pipeline,
+rf_metrics, rf_preds, rf_probs, rf_cm, rf_class_breakdown = evaluate_model(
+    "Weighted Random Forest",
+    weighted_random_forest_pipeline,
     X_test,
     y_test
 )
 
 
 # ------------------------------------------------------------
-# 11) COMPARE MODELS
+# 12) COMPARE MODEL PERFORMANCE
 # ------------------------------------------------------------
 comparison_df = pd.DataFrame([log_metrics, rf_metrics])
 
 print("\n" + "=" * 80)
-print("MODEL COMPARISON")
+print("WEIGHTED MODEL COMPARISON")
 print("=" * 80)
 print(comparison_df.to_string(index=False))
 print("=" * 80)
 
-best_model_name = comparison_df.sort_values(
-    by=["Accuracy", "Macro_F1", "Balanced_Accuracy"],
+# Choose best model by balanced accuracy first, then macro F1, then accuracy
+best_model_row = comparison_df.sort_values(
+    by=["Balanced_Accuracy", "Macro_F1", "Accuracy"],
     ascending=False
-).iloc[0]["Model"]
+).iloc[0]
 
-print(f"Best model by this comparison: {best_model_name}")
+best_model_name = best_model_row["Model"]
+
+print(f"Best weighted model by this comparison: {best_model_name}")
 print("=" * 80)
 
 
 # ------------------------------------------------------------
-# 12) ACTUAL VS PREDICTED COUNTS
+# 13) ACTUAL VS PREDICTED COUNTS
 # ------------------------------------------------------------
 def print_actual_vs_predicted_counts(model_name, y_true, y_pred):
+    """
+    Prints how many matches of each class actually occurred
+    vs how many were predicted.
+    """
     actual_counts = pd.Series(y_true).value_counts().sort_index()
     pred_counts = pd.Series(y_pred).value_counts().sort_index()
 
@@ -472,40 +566,16 @@ def print_actual_vs_predicted_counts(model_name, y_true, y_pred):
     print("-" * 80)
 
 
-print_actual_vs_predicted_counts("Logistic Regression", y_test, log_preds)
-print_actual_vs_predicted_counts("Random Forest", y_test, rf_preds)
+print_actual_vs_predicted_counts("Weighted Logistic Regression", y_test, log_preds)
+print_actual_vs_predicted_counts("Weighted Random Forest", y_test, rf_preds)
 
 
 # ------------------------------------------------------------
-# 13) PLOT CONFUSION MATRICES
-# ------------------------------------------------------------
-fig, axes = plt.subplots(1, 2, figsize=(14, 6))
-
-log_disp = ConfusionMatrixDisplay(
-    confusion_matrix=log_cm,
-    display_labels=["H", "D", "A"]
-)
-log_disp.plot(ax=axes[0], cmap="Blues", values_format="d", colorbar=False)
-axes[0].set_title("Logistic Regression Confusion Matrix")
-
-rf_disp = ConfusionMatrixDisplay(
-    confusion_matrix=rf_cm,
-    display_labels=["H", "D", "A"]
-)
-rf_disp.plot(ax=axes[1], cmap="Greens", values_format="d", colorbar=False)
-axes[1].set_title("Random Forest Confusion Matrix")
-
-plt.suptitle(f"Model Comparison on Test Season ({latest_season})")
-plt.tight_layout()
-plt.show()
-
-
-# ------------------------------------------------------------
-# 14) CREATE RESULTS TABLE FOR BOTH MODELS
+# 14) BUILD RESULTS TABLES
 # ------------------------------------------------------------
 def build_prediction_output(test_df, predictions, probabilities, model_classes, model_name):
     """
-    Creates a readable results table for a model.
+    Builds a readable prediction output table for each model.
     """
     proba_df = pd.DataFrame(probabilities, columns=model_classes)
 
@@ -522,25 +592,33 @@ def build_prediction_output(test_df, predictions, probabilities, model_classes, 
     return output
 
 
-log_classes = logistic_pipeline.named_steps["model"].classes_
-rf_classes = random_forest_pipeline.named_steps["model"].classes_
+log_classes = weighted_logistic_pipeline.named_steps["model"].classes_
+rf_classes = weighted_random_forest_pipeline.named_steps["model"].classes_
 
 log_results = build_prediction_output(
-    test_df, log_preds, log_probs, log_classes, "Logistic Regression"
+    test_df,
+    log_preds,
+    log_probs,
+    log_classes,
+    "Weighted Logistic Regression"
 )
 
 rf_results = build_prediction_output(
-    test_df, rf_preds, rf_probs, rf_classes, "Random Forest"
+    test_df,
+    rf_preds,
+    rf_probs,
+    rf_classes,
+    "Weighted Random Forest"
 )
 
-print("\nSample Logistic Regression Predictions:")
+print("\nSample predictions - Weighted Logistic Regression:")
 print(
     log_results[
         ["Date", "HomeTeam", "AwayTeam", "FTR", "Predicted", "Correct", "Prob_H", "Prob_D", "Prob_A", "Confidence"]
     ].head(10).to_string(index=False)
 )
 
-print("\nSample Random Forest Predictions:")
+print("\nSample predictions - Weighted Random Forest:")
 print(
     rf_results[
         ["Date", "HomeTeam", "AwayTeam", "FTR", "Predicted", "Correct", "Prob_H", "Prob_D", "Prob_A", "Confidence"]
@@ -549,21 +627,48 @@ print(
 
 
 # ------------------------------------------------------------
-# 15) CHOOSE THE BETTER MODEL FOR FUTURE FIXTURE PREDICTIONS
+# 15) PLOT CONFUSION MATRICES
 # ------------------------------------------------------------
-if best_model_name == "Random Forest":
-    best_pipeline = random_forest_pipeline
+# These are exactly the two confusion matrices requested:
+# - Weighted Logistic Regression
+# - Weighted Random Forest
+fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+
+log_disp = ConfusionMatrixDisplay(
+    confusion_matrix=log_cm,
+    display_labels=["H", "D", "A"]
+)
+log_disp.plot(ax=axes[0], cmap="Blues", values_format="d", colorbar=False)
+axes[0].set_title("Weighted Logistic Regression")
+
+rf_disp = ConfusionMatrixDisplay(
+    confusion_matrix=rf_cm,
+    display_labels=["H", "D", "A"]
+)
+rf_disp.plot(ax=axes[1], cmap="Greens", values_format="d", colorbar=False)
+axes[1].set_title("Weighted Random Forest")
+
+plt.suptitle(f"Confusion Matrices on Test Season ({latest_season})")
+plt.tight_layout()
+plt.show()
+
+
+# ------------------------------------------------------------
+# 16) CHOOSE BEST MODEL FOR FUTURE FIXTURE PREDICTIONS
+# ------------------------------------------------------------
+if best_model_name == "Weighted Random Forest":
+    best_pipeline = weighted_random_forest_pipeline
 else:
-    best_pipeline = logistic_pipeline
+    best_pipeline = weighted_logistic_pipeline
 
 
 # ------------------------------------------------------------
-# 16) FUNCTION TO PREDICT A NEW FIXTURE
+# 17) FIXTURE PREDICTION FUNCTION
 # ------------------------------------------------------------
 def predict_fixture(home_team, away_team, pipeline_to_use, pipeline_name):
     """
-    Predicts the result probabilities for a new fixture
-    using the latest team stats and a chosen trained model.
+    Predicts the result probabilities for a new fixture using
+    the latest available team stats and the chosen trained model.
     """
     current_season = matches["SourceFile"].iloc[-1]
 
@@ -665,7 +770,7 @@ def predict_fixture(home_team, away_team, pipeline_to_use, pipeline_name):
 
 
 # ------------------------------------------------------------
-# 17) EXAMPLE NEW FIXTURE PREDICTIONS
+# 18) EXAMPLE FUTURE FIXTURE PREDICTIONS
 # ------------------------------------------------------------
 predict_fixture("Arsenal", "Chelsea", best_pipeline, best_model_name)
 predict_fixture("Liverpool", "Man City", best_pipeline, best_model_name)
